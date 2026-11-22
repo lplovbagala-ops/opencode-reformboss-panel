@@ -36,6 +36,7 @@ const LOGIN_BRIDGE = `(() => {
 const api = Ipc.define({ id: 'reformboss-panel.data', methods: {
   refresh: { output: Schema.String }, login: {}, saveKeys: { input: Schema.String, output: Schema.Number },
   syncPlan: { output: Schema.String }, syncApply: { output: Schema.String },
+  poolStatus: { output: Schema.String },
 }});
 function text(value) {
   return value.replace(/&(?:amp|lt|gt|quot|apos|#39);/g, entity => ({
@@ -321,6 +322,18 @@ exports.default = Plugin.define({
       },
       async syncPlan() { return JSON.stringify(await planModels()); },
       async syncApply() { return JSON.stringify(await applyModels()); },
+      async poolStatus() {
+        const file = resolve(homedir(), '.config', 'opencode', 'reformboss-panel-port.json');
+        let info;
+        try { info = JSON.parse((await readFile(file, 'utf8')).replace(/^\uFEFF/, '')); } catch { return JSON.stringify({ state: 'off' }); }
+        if (!Number.isSafeInteger(info?.port)) return JSON.stringify({ state: 'off' });
+        try {
+          const response = await fetch('http://127.0.0.1:' + info.port + '/health', { cache: 'no-store', signal: AbortSignal.timeout(2500) });
+          if (!response.ok) throw Error('http ' + response.status);
+          const health = await response.json();
+          return JSON.stringify({ state: 'ready', port: info.port, keys: health.keys, perKey: health.perKey, models: health.models });
+        } catch { return JSON.stringify({ state: 'off', port: info.port }); }
+      },
       refresh,
       login() {
         ctx.log.write('info', 'ReformBoss login requested');
@@ -571,6 +584,7 @@ exports.default = Plugin.define({
         settings.style.display = open ? 'flex' : 'none';
         settingsButton.setAttribute('aria-expanded', String(open));
         settingsButton.style.opacity = open ? '1' : '';
+        if (open) void refreshPool();
       }
       el('div', 'Статус', 'font-size:9.5px;letter-spacing:.06em;text-transform:uppercase;opacity:.5', settings);
       const chips = el('div', '', 'display:flex;flex-wrap:wrap;gap:4px', settings);
@@ -593,6 +607,18 @@ exports.default = Plugin.define({
       pinBox.title = 'Выключите, чтобы перетащить панель за шапку';
       pinBox.onchange = () => { pinned = pinBox.checked; applyPinned(); };
       el('span', 'Фиксировать позицию', 'opacity:.8', pinRow);
+
+      const poolStatus = el('div', '', 'font-size:10.5px;opacity:.7', settings);
+      async function refreshPool() {
+        try {
+          const data = JSON.parse(await bridge.poolStatus());
+          if (data.state !== 'ready') { poolStatus.textContent = 'Ротация ключей: выключена (нужно ≥2 ключа в «Ключи»)'; return; }
+          const cooling = (data.models || []).filter(model => Number(model.cooldownUntil) > Date.now()).length;
+          poolStatus.textContent = 'Ротация ключей: ' + data.keys + ' × ' + data.perKey + ' потока' + (cooling ? ' · в паузе: ' + cooling : '');
+        } catch {
+          poolStatus.textContent = 'Ротация ключей: состояние недоступно';
+        }
+      }
 
       const syncBox = el('div', '', 'display:grid;gap:5px;padding-top:7px;border-top:1px solid color-mix(in srgb,currentColor 8%,transparent)', settings);
       el('div', 'Модели в opencode.json', 'font-size:9.5px;letter-spacing:.06em;text-transform:uppercase;opacity:.5', syncBox);
