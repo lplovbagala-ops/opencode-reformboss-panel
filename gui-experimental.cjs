@@ -37,6 +37,9 @@ const api = Ipc.define({ id: 'reformboss-panel.data', methods: {
   refresh: { output: Schema.String }, login: {}, saveKeys: { input: Schema.String, output: Schema.Number },
   syncPlan: { output: Schema.String }, syncApply: { output: Schema.String },
   poolStatus: { output: Schema.String },
+  presetsList: { output: Schema.String },
+  presetsSave: { input: Schema.String, output: Schema.String },
+  presetsApply: { input: Schema.String, output: Schema.String },
 }});
 function text(value) {
   return value.replace(/&(?:amp|lt|gt|quot|apos|#39);/g, entity => ({
@@ -259,11 +262,16 @@ exports.default = Plugin.define({
       for (const agent of Object.values(config.agents || {})) add(agent?.model);
       return ids;
     }
-    async function readConfig() {
+    async function readConfigRaw() {
       let raw;
       try { raw = await readFile(configFile(), 'utf8'); } catch { throw Error('config'); }
       let config;
       try { config = JSON.parse(raw.replace(/^\uFEFF/, '')); } catch { throw Error('config'); }
+      if (!config || typeof config !== 'object' || Array.isArray(config)) throw Error('config');
+      return { raw, config };
+    }
+    async function readConfig() {
+      const { raw, config } = await readConfigRaw();
       const models = config?.provider?.reformboss?.models;
       if (!models || typeof models !== 'object' || Array.isArray(models)) throw Error('provider');
       return { raw, config, models };
@@ -303,6 +311,71 @@ exports.default = Plugin.define({
       await rename(file + '.tmp', file);
       ctx.log.write('info', 'ReformBoss model list synced', { added: plan.add.length, removed: plan.remove.length });
       return { added: plan.add.length, removed: plan.remove.length, backup };
+    }
+
+    const AGENT_SLOTS = ['build', 'plan', 'general', 'explore'];
+    const presetsFile = () => resolve(homedir(), '.config', 'opencode', 'model-presets.json');
+    const modelString = value => (typeof value === 'string' && /^[\w.\-]+\/[\w.\-/]{1,120}$/.test(value) ? value : null);
+    function snapshotPreset(config) {
+      const agents = {};
+      for (const slot of AGENT_SLOTS) {
+        const model = modelString(config?.agents?.[slot]?.model);
+        if (model) agents[slot] = model;
+      }
+      return { model: modelString(config?.model), small_model: modelString(config?.small_model), agents };
+    }
+    function cleanPresetName(value) {
+      const name = String(value ?? '').trim().replace(/\s+/g, ' ');
+      if (!name || name.length > 40) throw Error('name');
+      return name;
+    }
+    async function readPresets() {
+      let raw;
+      try { raw = JSON.parse((await readFile(presetsFile(), 'utf8')).replace(/^\uFEFF/, '')); } catch { return []; }
+      if (!Array.isArray(raw)) return [];
+      return raw
+        .filter(item => item && typeof item.name === 'string')
+        .map(item => ({ name: item.name.slice(0, 40), ...snapshotPreset(item) }));
+    }
+    async function writePresets(list) {
+      const file = presetsFile();
+      await writeFile(file + '.tmp', JSON.stringify(list, null, 2) + '\n', { mode: 0o600 });
+      await rename(file + '.tmp', file);
+    }
+    async function savePreset(name) {
+      const preset = { name: cleanPresetName(name) };
+      const { config } = await readConfigRaw();
+      Object.assign(preset, snapshotPreset(config));
+      const list = (await readPresets()).filter(item => item.name !== preset.name);
+      list.push(preset);
+      list.sort((a, b) => a.name.localeCompare(b.name, 'ru'));
+      await writePresets(list);
+      return { name: preset.name, count: list.length, preset };
+    }
+    async function applyPreset(name) {
+      const preset = (await readPresets()).find(item => item.name === cleanPresetName(name));
+      if (!preset) throw Error('preset');
+      const { raw, config } = await readConfigRaw();
+      const known = new Set(Object.keys(config.provider || {}));
+      const used = [preset.model, preset.small_model, ...Object.values(preset.agents || {})].filter(Boolean);
+      for (const model of used) {
+        if (!known.has(model.split('/')[0])) throw Error('provider');
+      }
+      if (preset.model) config.model = preset.model;
+      if (preset.small_model) config.small_model = preset.small_model;
+      for (const [slot, model] of Object.entries(preset.agents || {})) {
+        if (!AGENT_SLOTS.includes(slot) || !modelString(model)) continue;
+        config.agents = config.agents || {};
+        config.agents[slot] = { ...(config.agents[slot] || {}), model };
+      }
+      const file = configFile();
+      const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
+      const backup = 'opencode.json.bak-presets-' + stamp;
+      await writeFile(resolve(file, '..', backup), raw, { mode: 0o600 });
+      await writeFile(file + '.tmp', JSON.stringify(config, null, 2) + '\n', { mode: 0o600 });
+      await rename(file + '.tmp', file);
+      ctx.log.write('info', 'ReformBoss preset applied', { name: preset.name });
+      return { applied: preset.name, backup };
     }
     ctx.provide(api, {
       async saveKeys(input) {
@@ -584,7 +657,7 @@ exports.default = Plugin.define({
         settings.style.display = open ? 'flex' : 'none';
         settingsButton.setAttribute('aria-expanded', String(open));
         settingsButton.style.opacity = open ? '1' : '';
-        if (open) void refreshPool();
+        if (open) void loadPresets();
       }
       el('div', 'Статус', 'font-size:9.5px;letter-spacing:.06em;text-transform:uppercase;opacity:.5', settings);
       const chips = el('div', '', 'display:flex;flex-wrap:wrap;gap:4px', settings);
@@ -607,18 +680,6 @@ exports.default = Plugin.define({
       pinBox.title = 'Выключите, чтобы перетащить панель за шапку';
       pinBox.onchange = () => { pinned = pinBox.checked; applyPinned(); };
       el('span', 'Фиксировать позицию', 'opacity:.8', pinRow);
-
-      const poolStatus = el('div', '', 'font-size:10.5px;opacity:.7', settings);
-      async function refreshPool() {
-        try {
-          const data = JSON.parse(await bridge.poolStatus());
-          if (data.state !== 'ready') { poolStatus.textContent = 'Ротация ключей: выключена (нужно ≥2 ключа в «Ключи»)'; return; }
-          const cooling = (data.models || []).filter(model => Number(model.cooldownUntil) > Date.now()).length;
-          poolStatus.textContent = 'Ротация ключей: ' + data.keys + ' × ' + data.perKey + ' потока' + (cooling ? ' · в паузе: ' + cooling : '');
-        } catch {
-          poolStatus.textContent = 'Ротация ключей: состояние недоступно';
-        }
-      }
 
       const syncBox = el('div', '', 'display:grid;gap:5px;padding-top:7px;border-top:1px solid color-mix(in srgb,currentColor 8%,transparent)', settings);
       el('div', 'Модели в opencode.json', 'font-size:9.5px;letter-spacing:.06em;text-transform:uppercase;opacity:.5', syncBox);
@@ -654,6 +715,64 @@ exports.default = Plugin.define({
         } catch { syncStatus.textContent = 'Запись не удалась — opencode.json не изменён.'; }
         finally { syncApplyButton.disabled = false; syncCheckButton.disabled = false; }
       }
+
+      const presetsBox = el('div', '', 'display:grid;gap:5px;padding-top:7px;border-top:1px solid color-mix(in srgb,currentColor 8%,transparent)', settings);
+      el('div', 'Пресеты моделей', 'font-size:9.5px;letter-spacing:.06em;text-transform:uppercase;opacity:.5', presetsBox);
+      const presetRow = el('div', '', 'display:flex;gap:5px;align-items:center', presetsBox);
+      const presetSelect = el('select', '', 'flex:1 1 auto;min-width:0;font:inherit;font-size:11px;padding:4px 6px;border-radius:7px;border:1px solid color-mix(in srgb,currentColor 12%,transparent);background:color-mix(in srgb,currentColor 4%,transparent);color:inherit', presetRow);
+      presetSelect.setAttribute('aria-label', 'Пресеты моделей');
+      const presetApplyButton = button('Применить', presetRow, () => void applyPreset());
+      const presetSaveRow = el('div', '', 'display:flex;gap:5px;align-items:center', presetsBox);
+      const presetName = el('input', '', 'flex:1 1 auto;min-width:0;font:inherit;font-size:11px;padding:4px 6px;border-radius:7px;border:1px solid color-mix(in srgb,currentColor 12%,transparent);background:color-mix(in srgb,currentColor 4%,transparent);color:inherit', presetSaveRow);
+      presetName.placeholder = 'Имя пресета';
+      presetName.setAttribute('aria-label', 'Имя нового пресета');
+      const presetSaveButton = button('Сохранить текущий', presetSaveRow, () => void saveCurrentPreset());
+      const presetStatus = el('div', '', 'font-size:10.5px;opacity:.7', presetsBox);
+      const samePreset = (a, b) => JSON.stringify({ model: a.model, small_model: a.small_model, agents: a.agents }) === JSON.stringify({ model: b.model, small_model: b.small_model, agents: b.agents });
+      async function loadPresets() {
+        try {
+          const data = JSON.parse(await bridge.presetsList());
+          presetSelect.replaceChildren();
+          for (const preset of data.presets) {
+            const option = document.createElement('option');
+            option.value = preset.name;
+            option.textContent = preset.name + (samePreset(preset, data.current) ? ' · текущий' : '');
+            presetSelect.append(option);
+          }
+          if (!data.presets.length) {
+            const option = document.createElement('option');
+            option.value = '';
+            option.textContent = 'нет сохранённых';
+            presetSelect.append(option);
+          }
+          presetApplyButton.disabled = !data.presets.length;
+        } catch { presetApplyButton.disabled = true; }
+      }
+      async function saveCurrentPreset() {
+        const name = presetName.value.trim();
+        if (!name) { presetStatus.textContent = 'Введите имя пресета.'; return; }
+        presetSaveButton.disabled = true;
+        try {
+          const result = JSON.parse(await bridge.presetsSave(name));
+          presetName.value = '';
+          presetStatus.textContent = 'Сохранено «' + result.name + '» · всего: ' + result.count;
+          await loadPresets();
+        } catch { presetStatus.textContent = 'Не удалось сохранить пресет.'; }
+        finally { presetSaveButton.disabled = false; }
+      }
+      async function applyPreset() {
+        const name = presetSelect.value;
+        if (!name) return;
+        presetApplyButton.disabled = true;
+        presetStatus.textContent = 'Применяю «' + name + '»…';
+        try {
+          const result = JSON.parse(await bridge.presetsApply(name));
+          presetStatus.textContent = 'Применён «' + result.applied + '» · бэкап: ' + result.backup + '. Перезапустите OpenCode.';
+          await loadPresets();
+        } catch { presetStatus.textContent = 'Не удалось применить: в пресете неизвестный провайдер или модель.'; }
+        finally { presetApplyButton.disabled = false; }
+      }
+      void loadPresets();
       const actions = el('div', '', 'display:flex;gap:5px;flex-wrap:wrap;align-items:center', settings);
       const keyForm = el('form', '', 'display:none;gap:5px;margin-top:2px', settings);
       const keyInput = el('input', '', 'min-width:0;font:inherit;font-size:11px;padding:5px 7px;border-radius:7px;border:1px solid color-mix(in srgb,currentColor 12%,transparent);background:color-mix(in srgb,currentColor 4%,transparent);color:inherit;outline:none', keyForm);
