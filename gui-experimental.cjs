@@ -35,6 +35,7 @@ const LOGIN_BRIDGE = `(() => {
 })()`;
 const api = Ipc.define({ id: 'reformboss-panel.data', methods: {
   refresh: { output: Schema.String }, login: {}, saveKeys: { input: Schema.String, output: Schema.Number },
+  syncPlan: { output: Schema.String }, syncApply: { output: Schema.String },
 }});
 function text(value) {
   return value.replace(/&(?:amp|lt|gt|quot|apos|#39);/g, entity => ({
@@ -233,6 +234,75 @@ exports.default = Plugin.define({
       return task;
     }
     let saving = false;
+    const configFile = () => resolve(homedir(), '.config', 'opencode', 'opencode.json');
+    function catalogIds(catalog) {
+      const table = catalog.match(/<table\b[^>]*\bid="cat"[^>]*>([\s\S]*?)<\/table>/i)?.[1];
+      if (!table) throw Error('catalog');
+      const ids = new Set();
+      for (const [, row] of table.matchAll(/<tr\b[^>]*>([\s\S]*?)<\/tr>/gi)) {
+        const model = row.match(/<th\b[^>]*class="model-name"[^>]*>([^<]+)<\/th>/i);
+        if (!model) continue;
+        const id = text(model[1]);
+        if (/^[\w.\-/]{1,120}$/.test(id)) ids.add(id);
+      }
+      if (ids.size < 5) throw Error('catalog');
+      return ids;
+    }
+    function protectedModels(config) {
+      const ids = new Set();
+      const add = value => {
+        const match = typeof value === 'string' ? value.match(/^reformboss\/(.+)$/) : null;
+        if (match) ids.add(match[1]);
+      };
+      add(config.model); add(config.small_model);
+      for (const agent of Object.values(config.agents || {})) add(agent?.model);
+      return ids;
+    }
+    async function readConfig() {
+      let raw;
+      try { raw = await readFile(configFile(), 'utf8'); } catch { throw Error('config'); }
+      let config;
+      try { config = JSON.parse(raw.replace(/^\uFEFF/, '')); } catch { throw Error('config'); }
+      const models = config?.provider?.reformboss?.models;
+      if (!models || typeof models !== 'object' || Array.isArray(models)) throw Error('provider');
+      return { raw, config, models };
+    }
+    async function planModels() {
+      if (!cachedCatalog) await refresh();
+      if (!cachedCatalog) throw Error('catalog');
+      const catalog = catalogIds(cachedCatalog);
+      // Absent from the price page is not the same as dead: the probe feed also lists
+      // served models (aliases), so only ids missing from both are treated as dead.
+      const probeIds = new Set((Array.isArray(cachedProbes?.models) ? cachedProbes.models : [])
+        .map(row => row?.id)
+        .filter(id => typeof id === 'string' && /^[\w.\-/]{1,120}$/.test(id)));
+      const alive = new Set([...catalog, ...probeIds]);
+      const { config, models } = await readConfig();
+      const current = new Set(Object.keys(models).filter(id => /^[\w.\-/]{1,120}$/.test(id)));
+      const locked = protectedModels(config);
+      const probed = probeIds.size > 0;
+      return {
+        add: [...catalog].filter(id => !current.has(id)).sort(),
+        remove: probed ? [...current].filter(id => !alive.has(id) && !locked.has(id)).sort() : [],
+        locked: [...current].filter(id => !alive.has(id) && locked.has(id)).sort(),
+        probes: probed,
+      };
+    }
+    async function applyModels() {
+      const plan = await planModels();
+      const { raw, config, models } = await readConfig();
+      for (const id of plan.remove) delete models[id];
+      for (const id of plan.add) models[id] = { name: id, tool_call: true, reasoning: true, temperature: true, limit: { context: 1048576, output: 32768 } };
+      if (!Object.keys(models).length) throw Error('empty');
+      const file = configFile();
+      const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
+      const backup = 'opencode.json.bak-models-' + stamp;
+      await writeFile(resolve(file, '..', backup), raw, { mode: 0o600 });
+      await writeFile(file + '.tmp', JSON.stringify(config, null, 2) + '\n', { mode: 0o600 });
+      await rename(file + '.tmp', file);
+      ctx.log.write('info', 'ReformBoss model list synced', { added: plan.add.length, removed: plan.remove.length });
+      return { added: plan.add.length, removed: plan.remove.length, backup };
+    }
     ctx.provide(api, {
       async saveKeys(input) {
         const incoming = [...new Set(input.trim().split(/[\s,]+/))];
@@ -249,6 +319,8 @@ exports.default = Plugin.define({
           return merged.length;
         } finally { saving = false; }
       },
+      async syncPlan() { return JSON.stringify(await planModels()); },
+      async syncApply() { return JSON.stringify(await applyModels()); },
       refresh,
       login() {
         ctx.log.write('info', 'ReformBoss login requested');
@@ -521,6 +593,41 @@ exports.default = Plugin.define({
       pinBox.title = 'Выключите, чтобы перетащить панель за шапку';
       pinBox.onchange = () => { pinned = pinBox.checked; applyPinned(); };
       el('span', 'Фиксировать позицию', 'opacity:.8', pinRow);
+
+      const syncBox = el('div', '', 'display:grid;gap:5px;padding-top:7px;border-top:1px solid color-mix(in srgb,currentColor 8%,transparent)', settings);
+      el('div', 'Модели в opencode.json', 'font-size:9.5px;letter-spacing:.06em;text-transform:uppercase;opacity:.5', syncBox);
+      const syncStatus = el('div', '', 'font-size:10.5px;opacity:.7', syncBox);
+      const syncButtons = el('div', '', 'display:flex;gap:5px;flex-wrap:wrap', syncBox);
+      const syncCheckButton = button('Сверить', syncButtons, () => void syncCheckModels());
+      const syncApplyButton = button('Применить', syncButtons, () => void syncApplyModels());
+      syncApplyButton.style.display = 'none';
+      syncApplyButton.style.color = '#5fd39a';
+      async function syncCheckModels() {
+        syncApplyButton.style.display = 'none';
+        syncCheckButton.disabled = true;
+        syncStatus.textContent = 'Сверяю каталог с конфигом…';
+        try {
+          const plan = JSON.parse(await bridge.syncPlan());
+          const parts = [];
+          if (plan.add.length) parts.push('добавить ' + plan.add.length);
+          if (plan.remove.length) parts.push('удалить ' + plan.remove.length);
+          const note = plan.probes ? '' : ' Сервис проб недоступен — удаление пропущено.';
+          if (!parts.length) { syncStatus.textContent = 'Совпадает: менять нечего.' + (plan.locked.length ? ' Под защитой: ' + plan.locked.length + '.' : '') + note; return; }
+          syncStatus.textContent = 'Будет ' + parts.join(', ') + (plan.locked.length ? ' · под защитой ' + plan.locked.length : '') + '. Перед записью сделаю бэкап.' + note;
+          syncApplyButton.style.display = '';
+        } catch { syncStatus.textContent = 'Не удалось сверить: нет каталога или opencode.json.'; }
+        finally { syncCheckButton.disabled = false; }
+      }
+      async function syncApplyModels() {
+        syncApplyButton.disabled = true; syncCheckButton.disabled = true;
+        syncStatus.textContent = 'Записываю opencode.json…';
+        try {
+          const result = JSON.parse(await bridge.syncApply());
+          syncStatus.textContent = 'Готово: +' + result.added + ' / −' + result.removed + '. Бэкап: ' + result.backup + '. Перезапустите OpenCode, чтобы список моделей обновился.';
+          syncApplyButton.style.display = 'none';
+        } catch { syncStatus.textContent = 'Запись не удалась — opencode.json не изменён.'; }
+        finally { syncApplyButton.disabled = false; syncCheckButton.disabled = false; }
+      }
       const actions = el('div', '', 'display:flex;gap:5px;flex-wrap:wrap;align-items:center', settings);
       const keyForm = el('form', '', 'display:none;gap:5px;margin-top:2px', settings);
       const keyInput = el('input', '', 'min-width:0;font:inherit;font-size:11px;padding:5px 7px;border-radius:7px;border:1px solid color-mix(in srgb,currentColor 12%,transparent);background:color-mix(in srgb,currentColor 4%,transparent);color:inherit;outline:none', keyForm);
