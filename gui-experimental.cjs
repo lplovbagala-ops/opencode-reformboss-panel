@@ -35,11 +35,8 @@ const LOGIN_BRIDGE = `(() => {
 })()`;
 const api = Ipc.define({ id: 'reformboss-panel.data', methods: {
   refresh: { output: Schema.String }, login: {}, saveKeys: { input: Schema.String, output: Schema.Number },
-  syncPlan: { output: Schema.String }, syncApply: { output: Schema.String },
+  syncPlan: { output: Schema.String }, syncApply: { input: Schema.String, output: Schema.String },
   poolStatus: { output: Schema.String },
-  presetsList: { output: Schema.String },
-  presetsSave: { input: Schema.String, output: Schema.String },
-  presetsApply: { input: Schema.String, output: Schema.String },
 }});
 function text(value) {
   return value.replace(/&(?:amp|lt|gt|quot|apos|#39);/g, entity => ({
@@ -162,11 +159,13 @@ const GEAR = "M12 15.5A3.5 3.5 0 0 1 8.5 12A3.5 3.5 0 0 1 12 8.5a3.5 3.5 0 0 1 3
 
 exports.default = Plugin.define({
   main(ctx) {
-    const { readFile, writeFile, rename } = require('node:fs/promises');
+    const { readFile, writeFile, rename, unlink } = require('node:fs/promises');
+    const { createHash, randomUUID } = require('node:crypto');
     const { resolve } = require('node:path');
     const { homedir } = require('node:os');
     const site = session.fromPartition('persist:reformboss-panel-v2');
     let loginWindow, pending, last, lastAt = 0, generation = 0, cachedCatalog, cachedProbes;
+    let liveCatalog, liveProbes;
     const windows = new Set();
     const allowed = url => { try { return [HOST, 'https://oauth.telegram.org'].includes(new URL(url).origin); } catch { return false; } };
     function secureWindow(win) {
@@ -189,9 +188,9 @@ exports.default = Plugin.define({
       win.webContents.on('did-create-window', child => secureWindow(child));
     }
     site.setPermissionRequestHandler((_wc, _permission, callback) => callback(false));
-    async function refresh() {
+    async function refresh(force = false) {
       if (pending) return pending;
-      if (last && Date.now() - lastAt < 10000) return last;
+      if (!force && last && Date.now() - lastAt < 10000) return last;
       const revision = generation;
       const task = (async () => {
         let result;
@@ -211,12 +210,18 @@ exports.default = Plugin.define({
           for (const [source, response] of Object.entries({ profile, catalog, health })) {
             if (response.status === 'rejected') ctx.log.write('warn', 'ReformBoss model source unavailable', { source });
           }
-          if (catalog.status === 'fulfilled') cachedCatalog = catalog.value;
-          if (!cachedCatalog) throw Error('catalog');
+          if (generation !== revision) return refresh();
+          liveCatalog = catalog.status === 'fulfilled' ? catalog.value : undefined;
+          if (liveCatalog) {
+            try { catalogIds(liveCatalog); cachedCatalog = liveCatalog; }
+            catch { liveCatalog = undefined; }
+          }
           let account = profile.status === 'fulfilled' ? profile.value : null;
           if (!Number.isSafeInteger(account?.rank)) account = null;
           const hasLiveProbes = health.status === 'fulfilled' && Array.isArray(health.value?.models);
+          liveProbes = hasLiveProbes ? health.value : undefined;
           if (hasLiveProbes) cachedProbes = health.value;
+          if (!cachedCatalog) throw Error('catalog');
           try { result = readModels(account, cachedCatalog, cachedProbes); }
           catch (error) {
             if (error.message !== 'rank') throw error;
@@ -237,7 +242,7 @@ exports.default = Plugin.define({
       pending = task;
       return task;
     }
-    let saving = false;
+    let saving = false, writingConfig = false;
     const configFile = () => resolve(homedir(), '.config', 'opencode', 'opencode.json');
     function catalogIds(catalog) {
       const table = catalog.match(/<table\b[^>]*\bid="cat"[^>]*>([\s\S]*?)<\/table>/i)?.[1];
@@ -259,7 +264,30 @@ exports.default = Plugin.define({
         if (match) ids.add(match[1]);
       };
       add(config.model); add(config.small_model);
-      for (const agent of Object.values(config.agents || {})) add(agent?.model);
+      for (const agent of Object.values(config.agents || {})) add(typeof agent === 'string' ? agent : agent?.model);
+      return ids;
+    }
+    async function gatewayIds(config) {
+      const options = config?.provider?.reformboss?.options;
+      const apiKey = typeof options?.apiKey === 'string' && /^[\w.-]{16,256}$/.test(options.apiKey) ? options.apiKey : null;
+      if (!apiKey || typeof options?.baseURL !== 'string') throw Error('gateway');
+      let endpoint;
+      try {
+        endpoint = new URL(options.baseURL);
+        if (!['http:', 'https:'].includes(endpoint.protocol)) throw Error('gateway');
+        endpoint.search = ''; endpoint.hash = '';
+        endpoint.pathname = endpoint.pathname.replace(/\/+$/, '').replace(/\/models$/, '') + '/models';
+      } catch { throw Error('gateway'); }
+      const response = await site.fetch(endpoint.href, {
+        credentials: 'omit', redirect: 'error', cache: 'no-store',
+        headers: { accept: 'application/json', authorization: 'Bearer ' + apiKey },
+        signal: AbortSignal.any([ctx.signal, AbortSignal.timeout(10000)]),
+      });
+      if (!response.ok) throw Error('gateway');
+      const payload = await response.json();
+      if (!Array.isArray(payload?.data)) throw Error('gateway');
+      const ids = new Set(payload.data.map(row => row?.id).filter(id => typeof id === 'string' && /^[\w.\-/]{1,120}$/.test(id)));
+      if (!ids.size) throw Error('gateway');
       return ids;
     }
     async function readConfigRaw() {
@@ -276,107 +304,81 @@ exports.default = Plugin.define({
       if (!models || typeof models !== 'object' || Array.isArray(models)) throw Error('provider');
       return { raw, config, models };
     }
-    async function planModels() {
-      if (!cachedCatalog) await refresh();
-      if (!cachedCatalog) throw Error('catalog');
-      const catalog = catalogIds(cachedCatalog);
-      // Absent from the price page is not the same as dead: the probe feed also lists
-      // served models (aliases), so only ids missing from both are treated as dead.
-      const probeIds = new Set((Array.isArray(cachedProbes?.models) ? cachedProbes.models : [])
-        .map(row => row?.id)
-        .filter(id => typeof id === 'string' && /^[\w.\-/]{1,120}$/.test(id)));
-      const alive = new Set([...catalog, ...probeIds]);
-      const { config, models } = await readConfig();
+    function planModels({ raw, config, models }, access, view) {
       const current = new Set(Object.keys(models).filter(id => /^[\w.\-/]{1,120}$/.test(id)));
       const locked = protectedModels(config);
-      const probed = probeIds.size > 0;
-      return {
-        add: [...catalog].filter(id => !current.has(id)).sort(),
-        remove: probed ? [...current].filter(id => !alive.has(id) && !locked.has(id)).sort() : [],
+      let desired, alive, source, ranked = false, canRemove;
+      if (access) {
+        // The gateway is authoritative: it returns exactly the ids this key may use,
+        // including rank restrictions, instead of the public catalogue.
+        desired = access;
+        alive = access;
+        source = 'gateway';
+        canRemove = true;
+      } else {
+        if (!liveCatalog) throw Error('catalog');
+        const catalog = catalogIds(liveCatalog);
+        ranked = view?.state === 'ready' && Boolean(view.rank);
+        desired = ranked ? new Set(view.models.map(model => model.id)) : catalog;
+        const probeIds = new Set((liveProbes?.models ?? [])
+          .map(row => row?.id)
+          .filter(id => typeof id === 'string' && /^[\w.\-/]{1,120}$/.test(id)));
+        // A cached probe may prove that an alias exists, but never authorizes deletion.
+        canRemove = view?.probes === 'live' && probeIds.size > 0;
+        alive = new Set([...desired, ...probeIds]);
+        source = 'catalog';
+      }
+      const plan = {
+        add: [...desired].filter(id => !current.has(id)).sort(),
+        remove: canRemove ? [...current].filter(id => !alive.has(id) && !locked.has(id)).sort() : [],
         locked: [...current].filter(id => !alive.has(id) && locked.has(id)).sort(),
-        probes: probed,
+        unchanged: [...current].filter(id => alive.has(id)).length,
+        total: desired.size,
+        source, ranked, canRemove,
       };
+      const token = createHash('sha256').update(raw).update(JSON.stringify(plan)).digest('hex');
+      return { ...plan, token };
     }
-    async function applyModels() {
-      const plan = await planModels();
-      const { raw, config, models } = await readConfig();
+    async function currentPlan(snapshot) {
+      const [viewResult, accessResult] = await Promise.allSettled([refresh(true), gatewayIds(snapshot.config)]);
+      let view;
+      if (viewResult.status === 'fulfilled') {
+        try { view = JSON.parse(viewResult.value); } catch {}
+      }
+      const access = accessResult.status === 'fulfilled' ? accessResult.value : null;
+      if (!access && !view) throw Error('catalog');
+      return planModels(snapshot, access, view);
+    }
+    async function saveConfig(raw, config, kind) {
+      const file = configFile();
+      const temporary = file + '.' + randomUUID() + '.tmp';
+      const stamp = new Date().toISOString().replace(/\D/g, '');
+      const backup = 'opencode.json.bak-' + kind + '-' + stamp;
+      await writeFile(resolve(file, '..', backup), raw, { mode: 0o600, flag: 'wx' });
+      try {
+        await writeFile(temporary, JSON.stringify(config, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
+        if (await readFile(file, 'utf8') !== raw) throw Error('changed');
+        await rename(temporary, file);
+        return backup;
+      } finally {
+        await unlink(temporary).catch(() => {});
+      }
+    }
+    async function applyModels(token) {
+      if (typeof token !== 'string' || !/^[a-f0-9]{64}$/.test(token)) return { stale: true };
+      const snapshot = await readConfig();
+      const plan = await currentPlan(snapshot);
+      if (token !== plan.token) return { stale: true };
+      if (!plan.add.length && !plan.remove.length) return { added: 0, removed: 0, changed: false, backup: null };
+      const { raw, config, models } = snapshot;
       for (const id of plan.remove) delete models[id];
       for (const id of plan.add) models[id] = { name: id, tool_call: true, reasoning: true, temperature: true, limit: { context: 1048576, output: 32768 } };
       if (!Object.keys(models).length) throw Error('empty');
-      const file = configFile();
-      const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
-      const backup = 'opencode.json.bak-models-' + stamp;
-      await writeFile(resolve(file, '..', backup), raw, { mode: 0o600 });
-      await writeFile(file + '.tmp', JSON.stringify(config, null, 2) + '\n', { mode: 0o600 });
-      await rename(file + '.tmp', file);
-      ctx.log.write('info', 'ReformBoss model list synced', { added: plan.add.length, removed: plan.remove.length });
-      return { added: plan.add.length, removed: plan.remove.length, backup };
+      const backup = await saveConfig(raw, config, 'models');
+      ctx.log.write('info', 'ReformBoss model list synced', { added: plan.add.length, removed: plan.remove.length, source: plan.source });
+      return { added: plan.add.length, removed: plan.remove.length, changed: true, backup };
     }
 
-    const AGENT_SLOTS = ['build', 'plan', 'general', 'explore'];
-    const presetsFile = () => resolve(homedir(), '.config', 'opencode', 'model-presets.json');
-    const modelString = value => (typeof value === 'string' && /^[\w.\-]+\/[\w.\-/]{1,120}$/.test(value) ? value : null);
-    function snapshotPreset(config) {
-      const agents = {};
-      for (const slot of AGENT_SLOTS) {
-        const model = modelString(config?.agents?.[slot]?.model);
-        if (model) agents[slot] = model;
-      }
-      return { model: modelString(config?.model), small_model: modelString(config?.small_model), agents };
-    }
-    function cleanPresetName(value) {
-      const name = String(value ?? '').trim().replace(/\s+/g, ' ');
-      if (!name || name.length > 40) throw Error('name');
-      return name;
-    }
-    async function readPresets() {
-      let raw;
-      try { raw = JSON.parse((await readFile(presetsFile(), 'utf8')).replace(/^\uFEFF/, '')); } catch { return []; }
-      if (!Array.isArray(raw)) return [];
-      return raw
-        .filter(item => item && typeof item.name === 'string')
-        .map(item => ({ name: item.name.slice(0, 40), ...snapshotPreset(item) }));
-    }
-    async function writePresets(list) {
-      const file = presetsFile();
-      await writeFile(file + '.tmp', JSON.stringify(list, null, 2) + '\n', { mode: 0o600 });
-      await rename(file + '.tmp', file);
-    }
-    async function savePreset(name) {
-      const preset = { name: cleanPresetName(name) };
-      const { config } = await readConfigRaw();
-      Object.assign(preset, snapshotPreset(config));
-      const list = (await readPresets()).filter(item => item.name !== preset.name);
-      list.push(preset);
-      list.sort((a, b) => a.name.localeCompare(b.name, 'ru'));
-      await writePresets(list);
-      return { name: preset.name, count: list.length, preset };
-    }
-    async function applyPreset(name) {
-      const preset = (await readPresets()).find(item => item.name === cleanPresetName(name));
-      if (!preset) throw Error('preset');
-      const { raw, config } = await readConfigRaw();
-      const known = new Set(Object.keys(config.provider || {}));
-      const used = [preset.model, preset.small_model, ...Object.values(preset.agents || {})].filter(Boolean);
-      for (const model of used) {
-        if (!known.has(model.split('/')[0])) throw Error('provider');
-      }
-      if (preset.model) config.model = preset.model;
-      if (preset.small_model) config.small_model = preset.small_model;
-      for (const [slot, model] of Object.entries(preset.agents || {})) {
-        if (!AGENT_SLOTS.includes(slot) || !modelString(model)) continue;
-        config.agents = config.agents || {};
-        config.agents[slot] = { ...(config.agents[slot] || {}), model };
-      }
-      const file = configFile();
-      const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
-      const backup = 'opencode.json.bak-presets-' + stamp;
-      await writeFile(resolve(file, '..', backup), raw, { mode: 0o600 });
-      await writeFile(file + '.tmp', JSON.stringify(config, null, 2) + '\n', { mode: 0o600 });
-      await rename(file + '.tmp', file);
-      ctx.log.write('info', 'ReformBoss preset applied', { name: preset.name });
-      return { applied: preset.name, backup };
-    }
     ctx.provide(api, {
       async saveKeys(input) {
         const incoming = [...new Set(input.trim().split(/[\s,]+/))];
@@ -393,8 +395,16 @@ exports.default = Plugin.define({
           return merged.length;
         } finally { saving = false; }
       },
-      async syncPlan() { return JSON.stringify(await planModels()); },
-      async syncApply() { return JSON.stringify(await applyModels()); },
+      async syncPlan() {
+        return JSON.stringify(await currentPlan(await readConfig()));
+      },
+      async syncApply(token) {
+        if (writingConfig) throw Error('busy');
+        writingConfig = true;
+        try {
+          return JSON.stringify(await applyModels(token));
+        } finally { writingConfig = false; }
+      },
       async poolStatus() {
         const file = resolve(homedir(), '.config', 'opencode', 'reformboss-panel-port.json');
         let info;
@@ -407,7 +417,7 @@ exports.default = Plugin.define({
           return JSON.stringify({ state: 'ready', port: info.port, keys: health.keys, perKey: health.perKey, models: health.models });
         } catch { return JSON.stringify({ state: 'off', port: info.port }); }
       },
-      refresh,
+      refresh: () => refresh(),
       login() {
         ctx.log.write('info', 'ReformBoss login requested');
         if (loginWindow && !loginWindow.isDestroyed()) { loginWindow.show(); loginWindow.focus(); return; }
@@ -415,7 +425,10 @@ exports.default = Plugin.define({
           autoHideMenuBar: true, webPreferences: { session: site, sandbox: true, contextIsolation: true, nodeIntegration: false } });
         // Authentication remains inside isolated website windows. No cookies or API keys cross IPC.
         secureWindow(loginWindow);
-        loginWindow.on('closed', () => { loginWindow = undefined; last = undefined; pending = undefined; generation++; });
+        loginWindow.on('closed', () => {
+          loginWindow = undefined; last = undefined; pending = undefined;
+          liveCatalog = undefined; liveProbes = undefined; generation++;
+        });
         void loginWindow.loadURL(HOST + '/console/#keys').then(() => {
           ctx.log.write('info', 'ReformBoss login page loaded');
         }).catch(e => { ctx.log.write('error', 'ReformBoss login page failed', { code: e.code || 'load-error' }); });
@@ -657,7 +670,6 @@ exports.default = Plugin.define({
         settings.style.display = open ? 'flex' : 'none';
         settingsButton.setAttribute('aria-expanded', String(open));
         settingsButton.style.opacity = open ? '1' : '';
-        if (open) void loadPresets();
       }
       el('div', 'Статус', 'font-size:9.5px;letter-spacing:.06em;text-transform:uppercase;opacity:.5', settings);
       const chips = el('div', '', 'display:flex;flex-wrap:wrap;gap:4px', settings);
@@ -684,95 +696,79 @@ exports.default = Plugin.define({
       const syncBox = el('div', '', 'display:grid;gap:5px;padding-top:7px;border-top:1px solid color-mix(in srgb,currentColor 8%,transparent)', settings);
       el('div', 'Модели в opencode.json', 'font-size:9.5px;letter-spacing:.06em;text-transform:uppercase;opacity:.5', syncBox);
       const syncStatus = el('div', '', 'font-size:10.5px;opacity:.7', syncBox);
+      const syncDetails = el('details', '', 'display:none;font-size:10px;opacity:.75', syncBox);
+      const syncDetailsSummary = el('summary', 'ID плана', 'cursor:pointer;opacity:.8;user-select:none', syncDetails);
+      const syncDetailsList = el('div', '', 'display:grid;gap:2px;max-height:132px;overflow:auto;margin-top:4px;font-family:ui-monospace,Consolas,monospace;font-size:10px;line-height:1.35;overflow-wrap:anywhere', syncDetails);
+      function renderSyncPlan(plan) {
+        syncDetailsList.replaceChildren();
+        const sections = [
+          ['Добавить', '+', plan.add],
+          ['Удалить', '−', plan.remove],
+          ['Под защитой', '·', plan.locked],
+        ];
+        let total = 0;
+        for (const [title, prefix, ids] of sections) {
+          if (!ids.length) continue;
+          total += ids.length;
+          el('div', title + ' (' + ids.length + ')', 'margin-top:3px;opacity:.6;font-family:Segoe UI,sans-serif;font-size:9.5px;text-transform:uppercase;letter-spacing:.05em', syncDetailsList);
+          for (const id of ids) el('div', prefix + ' ' + id, '', syncDetailsList);
+        }
+        syncDetailsSummary.textContent = 'ID плана (' + total + ')';
+        syncDetails.style.display = total ? 'block' : 'none';
+      }
       const syncButtons = el('div', '', 'display:flex;gap:5px;flex-wrap:wrap', syncBox);
       const syncCheckButton = button('Сверить', syncButtons, () => void syncCheckModels());
       const syncApplyButton = button('Применить', syncButtons, () => void syncApplyModels());
       syncApplyButton.style.display = 'none';
       syncApplyButton.style.color = '#5fd39a';
+      let syncToken;
       async function syncCheckModels() {
+        syncToken = undefined;
         syncApplyButton.style.display = 'none';
         syncCheckButton.disabled = true;
-        syncStatus.textContent = 'Сверяю каталог с конфигом…';
+        syncStatus.textContent = 'Сверяю доступные ключу модели с конфигом…';
         try {
           const plan = JSON.parse(await bridge.syncPlan());
+          renderSyncPlan(plan);
           const parts = [];
           if (plan.add.length) parts.push('добавить ' + plan.add.length);
           if (plan.remove.length) parts.push('удалить ' + plan.remove.length);
-          const note = plan.probes ? '' : ' Сервис проб недоступен — удаление пропущено.';
-          if (!parts.length) { syncStatus.textContent = 'Совпадает: менять нечего.' + (plan.locked.length ? ' Под защитой: ' + plan.locked.length + '.' : '') + note; return; }
-          syncStatus.textContent = 'Будет ' + parts.join(', ') + (plan.locked.length ? ' · под защитой ' + plan.locked.length : '') + '. Перед записью сделаю бэкап.' + note;
+          const source = plan.source === 'gateway'
+            ? 'Доступно ключу: ' + plan.total + '.'
+            : (plan.ranked ? 'Резерв: каталог по рангу.' : 'Резерв: общий каталог.');
+          const note = plan.canRemove ? '' : ' Удаление пропущено: нет свежего списка /v1/models и проб.';
+          if (!parts.length) {
+            syncStatus.textContent = 'Совпадает: ' + plan.unchanged + ' без изменений.' + (plan.locked.length ? ' Под защитой: ' + plan.locked.length + '.' : '') + ' ' + source + note;
+            return;
+          }
+          syncStatus.textContent = 'Будет ' + parts.join(', ') + ' · без изменений ' + plan.unchanged + (plan.locked.length ? ' · под защитой ' + plan.locked.length : '') + '. ' + source + ' Перед записью сделаю бэкап.' + note;
+          syncToken = plan.token;
           syncApplyButton.style.display = '';
-        } catch { syncStatus.textContent = 'Не удалось сверить: нет каталога или opencode.json.'; }
+        } catch { syncStatus.textContent = 'Не удалось сверить: нет доступа к каталогу или opencode.json.'; }
         finally { syncCheckButton.disabled = false; }
       }
       async function syncApplyModels() {
+        if (!syncToken) return;
         syncApplyButton.disabled = true; syncCheckButton.disabled = true;
         syncStatus.textContent = 'Записываю opencode.json…';
         try {
-          const result = JSON.parse(await bridge.syncApply());
-          syncStatus.textContent = 'Готово: +' + result.added + ' / −' + result.removed + '. Бэкап: ' + result.backup + '. Перезапустите OpenCode, чтобы список моделей обновился.';
+          const result = JSON.parse(await bridge.syncApply(syncToken));
+          syncToken = undefined;
           syncApplyButton.style.display = 'none';
+          if (result.stale) {
+            syncDetails.style.display = 'none';
+            syncStatus.textContent = 'План устарел: конфиг или доступные модели изменились. Нажмите «Сверить» ещё раз.';
+            return;
+          }
+          if (result.changed === false) {
+            syncStatus.textContent = 'Менять нечего — opencode.json не тронут.';
+            return;
+          }
+          syncStatus.textContent = 'Готово: +' + result.added + ' / −' + result.removed + '. Бэкап: ' + result.backup + '. Перезапустите OpenCode, чтобы список моделей обновился.';
         } catch { syncStatus.textContent = 'Запись не удалась — opencode.json не изменён.'; }
         finally { syncApplyButton.disabled = false; syncCheckButton.disabled = false; }
       }
 
-      const presetsBox = el('div', '', 'display:grid;gap:5px;padding-top:7px;border-top:1px solid color-mix(in srgb,currentColor 8%,transparent)', settings);
-      el('div', 'Пресеты моделей', 'font-size:9.5px;letter-spacing:.06em;text-transform:uppercase;opacity:.5', presetsBox);
-      const presetRow = el('div', '', 'display:flex;gap:5px;align-items:center', presetsBox);
-      const presetSelect = el('select', '', 'flex:1 1 auto;min-width:0;font:inherit;font-size:11px;padding:4px 6px;border-radius:7px;border:1px solid color-mix(in srgb,currentColor 12%,transparent);background:color-mix(in srgb,currentColor 4%,transparent);color:inherit', presetRow);
-      presetSelect.setAttribute('aria-label', 'Пресеты моделей');
-      const presetApplyButton = button('Применить', presetRow, () => void applyPreset());
-      const presetSaveRow = el('div', '', 'display:flex;gap:5px;align-items:center', presetsBox);
-      const presetName = el('input', '', 'flex:1 1 auto;min-width:0;font:inherit;font-size:11px;padding:4px 6px;border-radius:7px;border:1px solid color-mix(in srgb,currentColor 12%,transparent);background:color-mix(in srgb,currentColor 4%,transparent);color:inherit', presetSaveRow);
-      presetName.placeholder = 'Имя пресета';
-      presetName.setAttribute('aria-label', 'Имя нового пресета');
-      const presetSaveButton = button('Сохранить текущий', presetSaveRow, () => void saveCurrentPreset());
-      const presetStatus = el('div', '', 'font-size:10.5px;opacity:.7', presetsBox);
-      const samePreset = (a, b) => JSON.stringify({ model: a.model, small_model: a.small_model, agents: a.agents }) === JSON.stringify({ model: b.model, small_model: b.small_model, agents: b.agents });
-      async function loadPresets() {
-        try {
-          const data = JSON.parse(await bridge.presetsList());
-          presetSelect.replaceChildren();
-          for (const preset of data.presets) {
-            const option = document.createElement('option');
-            option.value = preset.name;
-            option.textContent = preset.name + (samePreset(preset, data.current) ? ' · текущий' : '');
-            presetSelect.append(option);
-          }
-          if (!data.presets.length) {
-            const option = document.createElement('option');
-            option.value = '';
-            option.textContent = 'нет сохранённых';
-            presetSelect.append(option);
-          }
-          presetApplyButton.disabled = !data.presets.length;
-        } catch { presetApplyButton.disabled = true; }
-      }
-      async function saveCurrentPreset() {
-        const name = presetName.value.trim();
-        if (!name) { presetStatus.textContent = 'Введите имя пресета.'; return; }
-        presetSaveButton.disabled = true;
-        try {
-          const result = JSON.parse(await bridge.presetsSave(name));
-          presetName.value = '';
-          presetStatus.textContent = 'Сохранено «' + result.name + '» · всего: ' + result.count;
-          await loadPresets();
-        } catch { presetStatus.textContent = 'Не удалось сохранить пресет.'; }
-        finally { presetSaveButton.disabled = false; }
-      }
-      async function applyPreset() {
-        const name = presetSelect.value;
-        if (!name) return;
-        presetApplyButton.disabled = true;
-        presetStatus.textContent = 'Применяю «' + name + '»…';
-        try {
-          const result = JSON.parse(await bridge.presetsApply(name));
-          presetStatus.textContent = 'Применён «' + result.applied + '» · бэкап: ' + result.backup + '. Перезапустите OpenCode.';
-          await loadPresets();
-        } catch { presetStatus.textContent = 'Не удалось применить: в пресете неизвестный провайдер или модель.'; }
-        finally { presetApplyButton.disabled = false; }
-      }
-      void loadPresets();
       const actions = el('div', '', 'display:flex;gap:5px;flex-wrap:wrap;align-items:center', settings);
       const keyForm = el('form', '', 'display:none;gap:5px;margin-top:2px', settings);
       const keyInput = el('input', '', 'min-width:0;font:inherit;font-size:11px;padding:5px 7px;border-radius:7px;border:1px solid color-mix(in srgb,currentColor 12%,transparent);background:color-mix(in srgb,currentColor 4%,transparent);color:inherit;outline:none', keyForm);
